@@ -77,6 +77,7 @@ class AirPlaySession(
     private var pendingNightMode: Boolean? = null
     private val firstTouchSendLogged = AtomicBoolean(false)
     private val touchSendFailureLogged = AtomicBoolean(false)
+    private var eventResponsesLogged = 0
     private val ntp = NtpClock()
     private var keepAliveSocket: DatagramSocket? = null
     private var keepAliveThread: Thread? = null
@@ -183,6 +184,20 @@ class AirPlaySession(
     fun invokeSiri() {
         sendCommand(linkedMapOf("type" to "requestSiri", "params" to linkedMapOf("siriAction" to 2)))
         sendCommand(linkedMapOf("type" to "requestSiri", "params" to linkedMapOf("siriAction" to 3)))
+    }
+
+    /**
+     * Asks the phone to encode and send a fresh IDR right now. The receiver sends
+     * this when its decode path stalls so the phone cuts the stale GOP instead of
+     * trickling frames that reference dropped pictures.
+     */
+    fun requestKeyframe() {
+        sendCommand(
+            linkedMapOf(
+                "type" to "forceKeyFrame",
+                "params" to linkedMapOf("uuid" to AirPlayInfoPlist.MAIN_UUID),
+            ),
+        )
     }
 
     fun sendIapMessage(data: ByteArray, timeoutMillis: Long = 0L): Boolean {
@@ -669,7 +684,16 @@ class AirPlaySession(
                 val parsed = RtspMessage.parseMessages(plaintext)
                 plaintext = parsed.rest
                 for (message in parsed.messages) {
-                    if (message.method.startsWith("RTSP/") || message.method.startsWith("HTTP/")) continue
+                    if (message.method.startsWith("RTSP/") || message.method.startsWith("HTTP/")) {
+                        // Phone ACK for a POST /command (e.g. a touch HID report).
+                        // Logged sparingly: the first response proves the event
+                        // channel is bidirectionally alive.
+                        if (eventResponsesLogged < EVENT_RESPONSE_LOG_LIMIT) {
+                            eventResponsesLogged++
+                            debugLog("airplay event response ${message.method.trim()}")
+                        }
+                        continue
+                    }
                     debugLog(
                         "airplay event rx ${message.method} ${message.path} cseq=${message.headers["cseq"] ?: "-"} body=${message.body.size}",
                     )
@@ -704,6 +728,7 @@ class AirPlaySession(
 
     private companion object {
         const val TAG = "xcertplay-usb"
+        const val EVENT_RESPONSE_LOG_LIMIT = 3
         const val PLIST_CONTENT_TYPE = "application/x-apple-binary-plist"
         const val PAIRING_CONTENT_TYPE = "application/pairing+tlv8"
         const val OCTET_CONTENT_TYPE = "application/octet-stream"

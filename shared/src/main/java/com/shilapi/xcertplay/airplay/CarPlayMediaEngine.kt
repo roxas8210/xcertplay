@@ -14,7 +14,7 @@ import java.util.concurrent.ConcurrentHashMap
 interface MediaSink {
     fun onVideoCodec(type: Int, codec: VideoCodec) {}
     fun onVideoConfig(type: Int, codecData: ByteArray) {}
-    fun onVideoFrame(type: Int, naluBytes: ByteArray) {}
+    fun onVideoFrame(type: Int, naluBytes: ByteArray, timestampMs: Long = -1L) {}
     fun onScreenStreamActive(type: Int, active: Boolean) {}
     fun onAudioStarted(type: Int, format: AudioFormat, firstSample: Int) {}
     fun onAudioRtp(type: Int, format: AudioFormat, rtp: ByteArray, sample: Int) {}
@@ -74,7 +74,8 @@ class CarPlayMediaEngine(
             object : ScreenStream.Listener {
                 override fun onCodec(codec: VideoCodec) = sink.onVideoCodec(type, codec)
                 override fun onConfig(codecData: ByteArray) = sink.onVideoConfig(type, codecData)
-                override fun onFrame(naluBytes: ByteArray) = sink.onVideoFrame(type, naluBytes)
+                override fun onFrame(naluBytes: ByteArray, timestampMs: Long) =
+                    sink.onVideoFrame(type, naluBytes, timestampMs)
                 override fun onClosed(cause: Throwable?) {
                     Log.w(
                         TAG,

@@ -41,15 +41,23 @@ object AirPlayHid {
         hidDeviceEntry(TELEPHONY_HID_UID, "xcertplay Telephony", telephonyDescriptor, displayUuid)
 
     fun touchReport(contacts: List<AirPlayContact>): ByteArray {
-        val report = ByteArray(BYTES_PER_FINGER * TOUCH_CONTACTS)
-        for (slot in 0 until TOUCH_CONTACTS) {
-            val offset = slot * BYTES_PER_FINGER
+        // Report layout: [contactCount u8][finger slots x (contactId, tip, x, y)].
+        // The leading contact count is part of the CarPlay HID touch protocol;
+        // iOS tracks fingers by contact id and drops reports without it. Each
+        // contact's id selects its slot so a finger keeps its id across reports.
+        val report = ByteArray(1 + BYTES_PER_FINGER * TOUCH_CONTACTS)
+        var populated = 0
+        for (contact in contacts) {
+            val slot = contact.id
+            if (slot !in 0 until TOUCH_CONTACTS) continue
+            val offset = 1 + slot * BYTES_PER_FINGER
             report[offset] = slot.toByte()
-            val contact = contacts.getOrNull(slot) ?: continue
             report[offset + 1] = if (contact.down) 0x01 else 0x00
             writeU16Le(report, offset + 2, Math.round(contact.x.coerceAtLeast(0.0)).toInt())
             writeU16Le(report, offset + 4, Math.round(contact.y.coerceAtLeast(0.0)).toInt())
+            populated++
         }
+        report[0] = populated.coerceAtMost(TOUCH_CONTACTS).toByte()
         return report
     }
 
@@ -88,6 +96,11 @@ object AirPlayHid {
     private fun multitouchDescriptor(xMax: Int, yMax: Int): ByteArray {
         val bytes = ArrayList<Int>()
         bytes.addAll(intArrayOf(0x05, 0x0d, 0x09, 0x04, 0xa1, 0x01).toList())
+        // Contact Count: how many finger slots in the report are valid. Declared
+        // before the finger collections so it leads the report bytes.
+        bytes.addAll(
+            intArrayOf(0x15, 0x00, 0x25, TOUCH_CONTACTS, 0x09, 0x54, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02).toList(),
+        )
         repeat(TOUCH_CONTACTS) { bytes.addAll(fingerCollection(xMax, yMax).toList()) }
         bytes.add(0xc0)
         return bytes.map { it.toByte() }.toByteArray()
@@ -95,7 +108,8 @@ object AirPlayHid {
 
     private fun fingerCollection(xMax: Int, yMax: Int): IntArray = intArrayOf(
         0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02,
-        0x09, 0x38, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
+        // Contact Identifier: the finger id iOS tracks across reports.
+        0x15, 0x00, 0x26, 0xff, 0x00, 0x09, 0x51, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
         0x15, 0x00, 0x25, 0x01, 0x09, 0x33, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02,
         0x95, 0x07, 0x81, 0x03,
         0x05, 0x01, 0x26, xMax and 0xff, (xMax shr 8) and 0xff, 0x09, 0x30, 0x75, 0x10, 0x95, 0x01, 0x81, 0x02,

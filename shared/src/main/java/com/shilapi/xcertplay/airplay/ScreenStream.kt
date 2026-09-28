@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.airplay
 
+import android.os.SystemClock
 import android.util.Log
 import java.io.Closeable
 import java.io.InputStream
@@ -23,13 +24,15 @@ class ScreenStream(private val key: ByteArray) : Closeable {
     interface Listener {
         fun onCodec(codec: VideoCodec) {}
         fun onConfig(codecData: ByteArray) {}
-        fun onFrame(naluBytes: ByteArray) {}
+        fun onFrame(naluBytes: ByteArray, timestampMs: Long) {}
         fun onClosed(cause: Throwable?) {}
     }
 
     private val closed = AtomicBoolean(false)
     private val frameCounter = AtomicLong(0)
     private val firstFrameLogged = AtomicBoolean(false)
+    private val controlHeaderLogged = AtomicBoolean(false)
+    private var lastTimestamp: Int? = null
     private var server: ServerSocket? = null
     private var socket: Socket? = null
     private var thread: Thread? = null
@@ -55,6 +58,10 @@ class ScreenStream(private val key: ByteArray) : Closeable {
     private fun accept(bound: ServerSocket) {
         try {
             val accepted = bound.accept()
+            // Scene changes arrive as bursts; a small receive window makes the
+            // phone stall behind TCP flow control until it looks like a freeze.
+            accepted.receiveBufferSize = RECEIVE_BUFFER_BYTES
+            accepted.tcpNoDelay = true
             socket = accepted
             run(accepted)
         } catch (error: Exception) {
@@ -63,7 +70,9 @@ class ScreenStream(private val key: ByteArray) : Closeable {
     }
 
     private fun run(sock: Socket) {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
         var failure: Throwable? = null
+        var lastMessageMs = SystemClock.elapsedRealtime()
         try {
             val input = sock.getInputStream()
             while (!closed.get()) {
@@ -71,6 +80,20 @@ class ScreenStream(private val key: ByteArray) : Closeable {
                 val bodySize = readU32Le(header, 0)
                 if (bodySize > MAX_BODY) break
                 val body = readFully(input, bodySize) ?: break
+                val nowMs = SystemClock.elapsedRealtime()
+                val gapMs = nowMs - lastMessageMs
+                lastMessageMs = nowMs
+                // A scene-change IDR stalls the stream while the phone encodes and
+                // transfers it; separating that stall from receiver-side decode
+                // time needs both halves logged.
+                if (gapMs > STREAM_GAP_LOG_THRESHOLD_MS) {
+                    Log.i(
+                        TAG,
+                        "video stream gap=${gapMs}ms then opcode=" +
+                            "${header[OPCODE_OFFSET].toInt() and 0xff} body=${body.size} " +
+                            "ts=${readU32Le(header, TIMESTAMP_OFFSET).toLong() and 0xffff_ffffL}",
+                    )
+                }
                 onMessage(header, body)
             }
         } catch (error: Exception) {
@@ -83,6 +106,17 @@ class ScreenStream(private val key: ByteArray) : Closeable {
     }
 
     private fun onMessage(header: ByteArray, body: ByteArray) {
+        if (header[OPCODE_OFFSET].toInt() and 0xff !in OP_VIDEO_FRAME..OP_VIDEO_CONFIG &&
+            controlHeaderLogged.compareAndSet(false, true)
+        ) {
+            // Unknown control message: dump once to identify whether the phone
+            // expects a response that would gate its send cadence.
+            Log.i(
+                TAG,
+                "video stream control opcode=${header[OPCODE_OFFSET].toInt() and 0xff} " +
+                    "header=${header.toHexString()}",
+            )
+        }
         when (header[OPCODE_OFFSET].toInt() and 0xff) {
             OP_VIDEO_FRAME -> {
                 val payload = if (body.size >= ScreenCodec.TAG_SIZE) {
@@ -91,6 +125,7 @@ class ScreenStream(private val key: ByteArray) : Closeable {
                 } else {
                     body
                 }
+                logFrameTimestamp(header)
                 if (firstFrameLogged.compareAndSet(false, true)) {
                     Log.i(
                         TAG,
@@ -98,7 +133,10 @@ class ScreenStream(private val key: ByteArray) : Closeable {
                         "head=${payload.hexPrefix(16)}",
                     )
                 }
-                listener.onFrame(ScreenCodec.lengthPrefixedToAnnexB(payload))
+                listener.onFrame(
+                    ScreenCodec.lengthPrefixedToAnnexB(payload),
+                    readU32Le(header, TIMESTAMP_OFFSET).toLong() and 0xffff_ffffL,
+                )
             }
             OP_VIDEO_CONFIG -> {
                 val (codec, codecData) = ScreenCodec.detectConfig(body)
@@ -107,6 +145,25 @@ class ScreenStream(private val key: ByteArray) : Closeable {
                 listener.onConfig(codecData)
             }
         }
+    }
+
+    /**
+     * Logs the candidate presentation timestamp in the 128-byte header (LE u32 at
+     * offset 8) so its units and cadence can be verified before render pacing
+     * uses it. Sparse: the first frames, then every [TIMESTAMP_LOG_INTERVAL]-th.
+     */
+    private fun logFrameTimestamp(header: ByteArray) {
+        val sequence = frameCounter.get()
+        if (sequence >= TIMESTAMP_LOG_SKIP && sequence % TIMESTAMP_LOG_INTERVAL != 0L) return
+        val raw = readU32Le(header, TIMESTAMP_OFFSET)
+        val last = lastTimestamp
+        lastTimestamp = raw
+        if (sequence < TIMESTAMP_LOG_SKIP || last == null) {
+            Log.i(TAG, "video frame ts raw=$raw seq=$sequence")
+            return
+        }
+        val delta = (raw - last).toInt()
+        Log.i(TAG, "video frame ts raw=$raw delta=$delta seq=$sequence")
     }
 
     private fun readFully(input: InputStream, length: Int): ByteArray? {
@@ -124,7 +181,12 @@ class ScreenStream(private val key: ByteArray) : Closeable {
     private companion object {
         const val TAG = "xcertplay-usb"
         const val HEADER_LEN = 128
+        const val STREAM_GAP_LOG_THRESHOLD_MS = 150L
+        const val RECEIVE_BUFFER_BYTES = 2 * 1024 * 1024
         const val OPCODE_OFFSET = 4
+        const val TIMESTAMP_OFFSET = 8
+        const val TIMESTAMP_LOG_SKIP = 3L
+        const val TIMESTAMP_LOG_INTERVAL = 300L
         const val OP_VIDEO_FRAME = 0
         const val OP_VIDEO_CONFIG = 1
         const val MAX_BODY = 8 * 1024 * 1024

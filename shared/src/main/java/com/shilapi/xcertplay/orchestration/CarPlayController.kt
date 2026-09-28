@@ -76,6 +76,8 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -162,7 +164,18 @@ class CarPlayController(
         },
     )
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
-    private val touchExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    // Bounded with discard-oldest: touch reports are high-frequency and stale
+    // moves are worthless once fresher ones are queued, but order is preserved
+    // so a final release always lands after its moves.
+    private val touchExecutor: ThreadPoolExecutor = ThreadPoolExecutor(
+        1,
+        1,
+        0L,
+        TimeUnit.MILLISECONDS,
+        LinkedBlockingQueue(TOUCH_QUEUE_CAPACITY),
+        { task -> Thread(task, "xcertplay-touch").apply { isDaemon = true } },
+        ThreadPoolExecutor.DiscardOldestPolicy(),
+    )
     private val tunnelExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val hostId = UUID.randomUUID().toString().uppercase(Locale.US)
@@ -319,6 +332,16 @@ class CarPlayController(
             restartWireless()
         } else {
             startIphone()
+        }
+    }
+
+    /** Asks the phone for an immediate IDR; used by the render pipeline when it stalls. */
+    fun requestVideoKeyframe() {
+        if (closed) return
+        try {
+            activeSession?.requestKeyframe()
+        } catch (_: Exception) {
+            // Session racing teardown; the next stall will retry.
         }
     }
 
@@ -1853,6 +1876,7 @@ class CarPlayController(
         private const val RFCOMM_CONNECT_TIMEOUT_MILLIS = 15_000L
         private const val MAXIMUM_REENUMERATION_ATTEMPTS = 2
         private const val EXECUTOR_CLOSE_TIMEOUT_MILLIS = 2_000L
+        private const val TOUCH_QUEUE_CAPACITY = 64
         private const val ADAPTER_ADDRESS_PLACEHOLDER = "02:00:00:00:00:00"
         private val BLUETOOTH_ADDRESS = Regex("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
     }

@@ -325,6 +325,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private var gestureTracking = false
     private var gestureStartX = 0f
     private var gestureStartY = 0f
+    private val touchMapper = CarPlayTouchMapper()
     private var edgeSettingsGestureCaptured = false
     private var edgeSettingsGestureEligible = false
     private val shuttingDown = AtomicBoolean(false)
@@ -3372,6 +3373,7 @@ class CarPlayHostActivity : ComponentActivity() {
         hotspotStatus = HotspotStatus(state = if (wirelessEnabled) "stopped" else "off")
         updateHotspotStatusBlock()
         val generation = ++restartGeneration
+        touchMapper.reset()
         controller?.sendTouch(emptyList())
         val oldController = controller
         val oldSink = sink
@@ -3506,6 +3508,7 @@ class CarPlayHostActivity : ComponentActivity() {
                     gestureTracking = true
                     gestureStartX = pointerCentroid(event, horizontal = true)
                     gestureStartY = pointerCentroid(event, horizontal = false)
+                    touchMapper.reset()
                     controller?.sendTouch(emptyList())
                     appendLog("Three-finger swipe tracking started")
                     return true
@@ -3565,7 +3568,7 @@ class CarPlayHostActivity : ComponentActivity() {
             return true
         }
 
-        val contacts = CarPlayTouchMapper.contacts(event, view.width, view.height)
+        val contacts = touchMapper.contacts(event, view.width, view.height)
         val queued = controller?.sendTouch(contacts) ?: false
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN,

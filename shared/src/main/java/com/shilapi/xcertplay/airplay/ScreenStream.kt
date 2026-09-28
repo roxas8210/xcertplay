@@ -1,5 +1,6 @@
 package com.shilapi.xcertplay.airplay
 
+import android.os.SystemClock
 import android.util.Log
 import com.shilapi.xcertplay.media.MediaCodecSupport
 import java.io.Closeable
@@ -32,6 +33,7 @@ class ScreenStream(private val key: ByteArray) : Closeable {
     private val closed = AtomicBoolean(false)
     private val frameCounter = AtomicLong(0)
     private val firstFrameLogged = AtomicBoolean(false)
+    private val controlHeaderLogged = AtomicBoolean(false)
     private var server: ServerSocket? = null
     private var socket: Socket? = null
     private var thread: Thread? = null
@@ -57,6 +59,10 @@ class ScreenStream(private val key: ByteArray) : Closeable {
     private fun accept(bound: ServerSocket) {
         try {
             val accepted = bound.accept()
+            // Scene changes arrive as bursts; a small receive window makes the
+            // phone stall behind TCP flow control until it looks like a freeze.
+            accepted.receiveBufferSize = RECEIVE_BUFFER_BYTES
+            accepted.tcpNoDelay = true
             socket = accepted
             run(accepted)
         } catch (error: Exception) {
@@ -65,7 +71,9 @@ class ScreenStream(private val key: ByteArray) : Closeable {
     }
 
     private fun run(sock: Socket) {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
         var failure: Throwable? = null
+        var lastMessageMs = SystemClock.elapsedRealtime()
         try {
             val input = sock.getInputStream()
             while (!closed.get()) {
@@ -73,6 +81,20 @@ class ScreenStream(private val key: ByteArray) : Closeable {
                 val bodySize = readU32Le(header, 0)
                 if (bodySize < 0 || bodySize > MAX_BODY) break
                 val body = readFully(input, bodySize) ?: break
+                val nowMs = SystemClock.elapsedRealtime()
+                val gapMs = nowMs - lastMessageMs
+                lastMessageMs = nowMs
+                // A scene-change IDR stalls the stream while the phone encodes and
+                // transfers it; separating that stall from receiver-side decode
+                // time needs both halves logged.
+                if (gapMs > STREAM_GAP_LOG_THRESHOLD_MS) {
+                    Log.i(
+                        TAG,
+                        "video stream gap=${gapMs}ms then opcode=" +
+                            "${header[OPCODE_OFFSET].toInt() and 0xff} body=${body.size} " +
+                            "ts=${readU32Le(header, TIMESTAMP_OFFSET).toLong() and 0xffff_ffffL}",
+                    )
+                }
                 onMessage(header, body)
             }
         } catch (error: Exception) {
@@ -85,6 +107,17 @@ class ScreenStream(private val key: ByteArray) : Closeable {
     }
 
     private fun onMessage(header: ByteArray, body: ByteArray) {
+        if (header[OPCODE_OFFSET].toInt() and 0xff !in OP_VIDEO_FRAME..OP_VIDEO_CONFIG &&
+            controlHeaderLogged.compareAndSet(false, true)
+        ) {
+            // Unknown control message: dump once to identify whether the phone
+            // expects a response that would gate its send cadence.
+            Log.i(
+                TAG,
+                "video stream control opcode=${header[OPCODE_OFFSET].toInt() and 0xff} " +
+                    "header=${header.toHexString()}",
+            )
+        }
         when (header[OPCODE_OFFSET].toInt() and 0xff) {
             OP_VIDEO_FRAME -> {
                 val payload = if (body.size >= ScreenCodec.TAG_SIZE) {
@@ -130,7 +163,10 @@ class ScreenStream(private val key: ByteArray) : Closeable {
     private companion object {
         const val TAG = "xcertplay-usb"
         const val HEADER_LEN = 128
+        const val STREAM_GAP_LOG_THRESHOLD_MS = 150L
+        const val RECEIVE_BUFFER_BYTES = 2 * 1024 * 1024
         const val OPCODE_OFFSET = 4
+        const val TIMESTAMP_OFFSET = 8
         const val OP_VIDEO_FRAME = 0
         const val OP_VIDEO_CONFIG = 1
         const val MAX_BODY = 8 * 1024 * 1024

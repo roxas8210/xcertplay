@@ -196,6 +196,7 @@ private class VideoDecoder(
     }
 
     private fun run() {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
         try {
             while (running) {
                 try {
@@ -524,11 +525,15 @@ private class AudioRenderer(
     }
 
     fun submit(rtp: ByteArray, sample: Int) {
-        if (!started || !queue.offer(AudioPacket(rtp, sample))) {
-            if (started && !droppedPacketsLogged) {
-                droppedPacketsLogged = true
-                Log.w(TAG, "audio queue full; dropping newest packets to bound latency")
-            }
+        if (!started) return
+        val packet = AudioPacket(rtp, sample)
+        if (queue.offer(packet)) return
+        // Shed the oldest packet so the freshest audio keeps playing and
+        // latency stays bounded.
+        queue.poll()
+        if (!queue.offer(packet) && !droppedPacketsLogged) {
+            droppedPacketsLogged = true
+            Log.w(TAG, "audio queue full; shedding oldest packets to bound latency")
         }
     }
 
@@ -538,6 +543,7 @@ private class AudioRenderer(
     }
 
     private fun run() {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
         try {
             when (format.codec) {
                 AudioCodecKind.AAC_LC -> configureCodec(MediaFormat.MIMETYPE_AUDIO_AAC)
@@ -738,12 +744,27 @@ private class AudioRenderer(
         }
     }
 
+    /**
+     * Waits up to [AUDIO_INPUT_WAIT_TIMEOUT_US] for a decoder input buffer so a
+     * brief stall drops the packet instead of punching an audible hole in the
+     * stream.
+     */
+    private fun awaitDecoderInput(codec: MediaCodec): Int {
+        val deadline = System.nanoTime() + AUDIO_INPUT_WAIT_TIMEOUT_US * 1_000
+        while (running) {
+            val index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+            if (index >= 0) return index
+            if (System.nanoTime() >= deadline) return -1
+        }
+        return -1
+    }
+
     private fun sampleTimestampUs(sample: Int): Long =
         (sample.toLong() and 0xffff_ffffL) * 1_000_000L / format.sampleRate
 
     private fun feedCodec(payload: ByteArray, presentationTimeUs: Long) {
         val codec = codec ?: return
-        val index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+        val index = awaitDecoderInput(codec)
         if (index < 0) {
             inputDropped++
             if (inputDropped == 1) {
@@ -915,8 +936,9 @@ private class AudioRenderer(
         const val OPUS_CODEC_DELAY_NANOS = 6_500_000L
         const val OPUS_SEEK_PRE_ROLL_NANOS = 80_000_000L
         const val INPUT_TIMEOUT_US = 10_000L
-        const val MAX_QUEUED_PACKETS = 64
-        const val MIN_TRACK_BUFFER_BYTES = 16 * 1024
+        const val AUDIO_INPUT_WAIT_TIMEOUT_US = 200_000L
+        const val MAX_QUEUED_PACKETS = 80
+        const val MIN_TRACK_BUFFER_BYTES = 64 * 1024
         const val MIN_START_BUFFER_BYTES = 4 * 1024
         const val PREBUFFER_WRITE_CHUNK_BYTES = 2 * 1024
         const val DECODED_BUFFER_LOG_INTERVAL = 50

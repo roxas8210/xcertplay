@@ -175,6 +175,7 @@ private class VideoDecoder(
     private var renderedFrameLogged = false
     private var submittedFrameLogged = false
     private var duplicateConfigLogged = false
+    private var awaitingConfigLogged = false
     private val thread = Thread(::run, "carplay-video").apply { isDaemon = true; start() }
 
     fun configure(codec: VideoCodec, codecData: ByteArray) {
@@ -261,6 +262,7 @@ private class VideoDecoder(
         }
         lastConfig = config
         duplicateConfigLogged = false
+        awaitingConfigLogged = false
         releaseDecoder()
         val surface = outputSurface ?: return
         val codec = config.codec
@@ -371,7 +373,19 @@ private class VideoDecoder(
     private fun feed(frame: VideoJob.Frame) {
         if (decoder == null) {
             if (outputSurface == null) return
-            lastConfig?.let(::configureDecoder)
+            val config = lastConfig
+            if (config == null) {
+                // The phone emits its codec config (opcode=1) before the first
+                // frame; frames without one mean it skipped that step (seen with
+                // HEVC). Nudge it instead of dropping frames forever.
+                if (!awaitingConfigLogged) {
+                    awaitingConfigLogged = true
+                    Log.i(TAG, "video frames without codec config; requesting keyframe")
+                }
+                needsKeyFrame = true
+                return
+            }
+            configureDecoder(config)
         }
         val activePump = pump ?: return
         val annexB = MediaCodecSupport.toAnnexB(frame.nalus)
